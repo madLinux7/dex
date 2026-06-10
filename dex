@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+
+set -e
+
+# Help command
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+    echo "dex - Docker Exec helper for quick container access"
+    echo ""
+    echo "Usage:"
+    echo "  dex -a, --assign [container_name]                  Assign a single container name"
+    echo "  dex -a, --assign [compose_file] [service_name]     Assign a service in a docker-compose file"
+    echo "  dex -c, --clear                                    Clear the local dex assignment"
+    echo "  dex --up [params]                                  Run docker compose up (compose mode only)"
+    echo "  dex --down [params]                                Run docker compose down (compose mode only)"
+    echo "  dex --restart [params]                             Restart the assigned container/service"
+    echo "  dex [COMMANDS]                                     Run commands inside the assigned container"
+    echo "  dex                                                Start an interactive shell in the assigned container"
+    exit 0
+fi
+
+# Clear command
+if [ "$1" = "--clear" ] || [ "$1" = "-c" ]; then
+    if [ -f .dex ]; then
+        rm .dex
+        echo "Cleared local dex assignment."
+    else
+        echo "No dex assignment found in this directory."
+    fi
+    exit 0
+fi
+
+# Assign command
+if [ "$1" = "--assign" ] || [ "$1" = "-a" ]; then
+    arg1="$2"
+    arg2="$3"
+    
+    if [ -z "$arg1" ]; then
+        echo "Error: --assign requires at least a container name or a docker-compose file and service name." >&2
+        echo "Usage:" >&2
+        echo "  dex -a [container_name]" >&2
+        echo "  dex -a [docker-compose-file] [service_name]" >&2
+        exit 1
+    fi
+    
+    if [ -n "$arg2" ]; then
+        # Two arguments passed: DOCKER_COMPOSE_FILE and SERVICE_NAME
+        if [ ! -f "$arg1" ]; then
+            echo "Error: Docker compose file '$arg1' does not exist." >&2
+            exit 1
+        fi
+        
+        # Write to .dex configuration
+        cat <<EOF > .dex
+MODE="compose"
+COMPOSE_FILE="$arg1"
+SERVICE_NAME="$arg2"
+SHELL="sh"
+EOF
+        echo "Successfully assigned service '$arg2' in '$arg1'."
+    else
+        # One argument passed: CONTAINER_NAME
+        cat <<EOF > .dex
+MODE="container"
+CONTAINER_NAME="$arg1"
+SHELL="sh"
+EOF
+        echo "Successfully assigned container '$arg1'."
+    fi
+    exit 0
+fi
+
+# Up, Down, Restart commands
+if [ "$1" = "--up" ] || [ "$1" = "--down" ] || [ "$1" = "--restart" ]; then
+    if [ ! -f .dex ]; then
+        echo "Error: No assignment found in this directory." >&2
+        exit 1
+    fi
+    
+    # Load configuration
+    # shellcheck source=/dev/null
+    source .dex
+    
+    cmd_type="$1"
+    shift # Remove the command flag from the arguments
+    
+    if [ "$MODE" = "compose" ]; then
+        case "$cmd_type" in
+            --up)
+                exec docker compose -f "$COMPOSE_FILE" up "$@"
+                ;;
+            --down)
+                exec docker compose -f "$COMPOSE_FILE" down "$@"
+                ;;
+            --restart)
+                exec docker compose -f "$COMPOSE_FILE" restart "$SERVICE_NAME" "$@"
+                ;;
+        esac
+    else
+        # Container Mode
+        if [ "$cmd_type" = "--restart" ]; then
+            # Verify container exists
+            STATUS=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || true)
+            if [ -z "$STATUS" ]; then
+                echo "Error: Container '$CONTAINER_NAME' does not exist." >&2
+                exit 1
+            fi
+            
+            if [ "$STATUS" = "running" ]; then
+                echo "Restarting container '$CONTAINER_NAME' (timeout: 5s)..."
+                exec docker restart --time 5 "$CONTAINER_NAME" "$@"
+            else
+                echo "Container '$CONTAINER_NAME' is not running (status: $STATUS). Starting it..."
+                exec docker start "$CONTAINER_NAME" "$@"
+            fi
+        else
+            echo "Error: '$cmd_type' is only supported when dex is assigned in compose mode." >&2
+            exit 1
+        fi
+    fi
+    exit 0
+fi
+
+# Execute / Interactive shell command
+if [ ! -f .dex ]; then
+    echo "Error: No assignment found in this directory." >&2
+    echo "Please assign a container first using:" >&2
+    echo "  dex -a [container_name]" >&2
+    echo "  dex -a [docker-compose-file] [service_name]" >&2
+    exit 1
+fi
+
+# Load local configuration
+# shellcheck source=/dev/null
+source .dex
+
+# Fallback defaults
+if [ -z "$SHELL" ]; then
+    SHELL="sh"
+fi
+
+CONTAINER=""
+if [ "$MODE" = "compose" ]; then
+    # Resolve container ID dynamically
+    CONTAINER=$(docker compose -f "$COMPOSE_FILE" ps -q "$SERVICE_NAME" 2>/dev/null)
+    if [ -z "$CONTAINER" ]; then
+        echo "Error: Container for service '$SERVICE_NAME' in '$COMPOSE_FILE' is not running." >&2
+        exit 1
+    fi
+elif [ "$MODE" = "container" ]; then
+    # Verify container is running
+    RUNNING=$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)
+    if [ "$RUNNING" != "true" ]; then
+        echo "Error: Container '$CONTAINER_NAME' is not running or does not exist." >&2
+        exit 1
+    fi
+    CONTAINER="$CONTAINER_NAME"
+else
+    echo "Error: Invalid mode '$MODE' in .dex configuration file." >&2
+    exit 1
+fi
+
+# Determine whether to run interactive shell or commands
+if [ $# -eq 0 ]; then
+    CMD=("$SHELL")
+else
+    CMD=("$@")
+fi
+
+# Setup interactive & TTY flags
+INTERACTIVE=""
+if [ -t 0 ]; then
+    INTERACTIVE="-i"
+fi
+
+TTY=""
+if [ -t 1 ]; then
+    TTY="-t"
+fi
+
+# Execute command inside container
+exec docker exec $INTERACTIVE $TTY "$CONTAINER" "${CMD[@]}"
